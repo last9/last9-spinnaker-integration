@@ -1,0 +1,12 @@
+{
+  "org_slug": "example",
+  "mappings": [
+    {
+      "application": "payments",
+      "pipeline": "deploy-production",
+      "service_name": "payments-api",
+      "deployment_environment": "production",
+      "env": "production"
+    }
+  ]
+}
