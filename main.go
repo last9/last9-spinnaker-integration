@@ -14,15 +14,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	maxRequestBytes        = 4 << 20
 	maxDedupEntries        = 100_000
+	maxArtifactCount       = 20
+	maxArtifactFieldBytes  = 256
 	defaultDeliveryTimeout = 15 * time.Second
 )
 
@@ -55,6 +59,7 @@ type EchoEvent struct {
 			StartTime int64  `json:"startTime"`
 			EndTime   int64  `json:"endTime"`
 			Trigger   struct {
+				Type       string         `json:"type"`
 				User       string         `json:"user"`
 				Parameters map[string]any `json:"parameters"`
 				Artifacts  []Artifact     `json:"artifacts"`
@@ -88,45 +93,73 @@ func (m *Millis) UnmarshalJSON(data []byte) error {
 }
 
 type ChangeEvent struct {
-	Timestamp  string         `json:"timestamp"`
-	EventName  string         `json:"event_name"`
-	EventState string         `json:"event_state"`
-	Attributes map[string]any `json:"attributes"`
+	Timestamp  string            `json:"timestamp"`
+	EventName  string            `json:"event_name"`
+	EventState string            `json:"event_state"`
+	Attributes map[string]string `json:"attributes"`
+}
+
+type dedupState uint8
+
+const (
+	dedupReserved dedupState = iota
+	dedupInFlight
+	dedupCompleted
+	dedupFull
+)
+
+type dedupEntry struct {
+	completed bool
+	expiresAt time.Time
 }
 
 type deduper struct {
 	mu      sync.Mutex
-	entries map[string]time.Time
+	entries map[string]dedupEntry
 	ttl     time.Duration
 }
 
 func newDeduper(ttl time.Duration) *deduper {
-	return &deduper{entries: make(map[string]time.Time), ttl: ttl}
+	return &deduper{entries: make(map[string]dedupEntry), ttl: ttl}
 }
 
-func (d *deduper) reserve(key string, now time.Time) bool {
+func (d *deduper) reserve(key string, now time.Time) dedupState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for k, expires := range d.entries {
-		if !expires.After(now) {
+	for k, entry := range d.entries {
+		if entry.completed && !entry.expiresAt.After(now) {
 			delete(d.entries, k)
 		}
 	}
-	if _, exists := d.entries[key]; exists {
-		return false
+	if entry, exists := d.entries[key]; exists {
+		if entry.completed {
+			return dedupCompleted
+		}
+		return dedupInFlight
 	}
 	if len(d.entries) >= maxDedupEntries {
 		var oldestKey string
 		var oldestExpiry time.Time
-		for candidate, expires := range d.entries {
-			if oldestKey == "" || expires.Before(oldestExpiry) {
-				oldestKey, oldestExpiry = candidate, expires
+		for candidate, entry := range d.entries {
+			if entry.completed && (oldestKey == "" || entry.expiresAt.Before(oldestExpiry)) {
+				oldestKey, oldestExpiry = candidate, entry.expiresAt
 			}
+		}
+		if oldestKey == "" {
+			return dedupFull
 		}
 		delete(d.entries, oldestKey)
 	}
-	d.entries[key] = now.Add(d.ttl)
-	return true
+	d.entries[key] = dedupEntry{}
+	return dedupReserved
+}
+
+func (d *deduper) complete(key string, now time.Time) {
+	d.mu.Lock()
+	if _, exists := d.entries[key]; exists {
+		d.entries[key] = dedupEntry{completed: true, expiresAt: now.Add(d.ttl)}
+	}
+	d.mu.Unlock()
 }
 
 func (d *deduper) release(key string) {
@@ -144,6 +177,23 @@ type tokenSource struct {
 	mu        sync.Mutex
 	cached    string
 	expiresAt time.Time
+	now       func() time.Time
+}
+
+func (s *tokenSource) currentTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func (s *tokenSource) invalidate(token string) {
+	s.mu.Lock()
+	if s.cached == token {
+		s.cached = ""
+		s.expiresAt = time.Time{}
+	}
+	s.mu.Unlock()
 }
 
 func (s *tokenSource) token(ctx context.Context) (string, error) {
@@ -154,7 +204,7 @@ func (s *tokenSource) token(ctx context.Context) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cached != "" && time.Now().Before(s.expiresAt) {
+	if s.cached != "" && s.currentTime().Before(s.expiresAt) {
 		return s.cached, nil
 	}
 	if s.refreshToken == "" {
@@ -187,12 +237,15 @@ func (s *tokenSource) token(ctx context.Context) (string, error) {
 		return "", errors.New("Last9 token response omitted access_token")
 	}
 	ttl := time.Duration(result.ExpiresIn) * time.Second
+	if ttl <= 0 {
+		return result.AccessToken, nil
+	}
 	if ttl <= time.Minute {
-		ttl = 50 * time.Minute
+		ttl /= 2
 	} else {
 		ttl -= time.Minute
 	}
-	s.cached, s.expiresAt = result.AccessToken, time.Now().Add(ttl)
+	s.cached, s.expiresAt = result.AccessToken, s.currentTime().Add(ttl)
 	return s.cached, nil
 }
 
@@ -205,6 +258,14 @@ type last9Client struct {
 	wait        func(context.Context, time.Duration) error
 }
 
+type deliveryError struct {
+	attempts int
+	err      error
+}
+
+func (e *deliveryError) Error() string { return e.err.Error() }
+func (e *deliveryError) Unwrap() error { return e.err }
+
 func (c *last9Client) send(ctx context.Context, orgSlug string, event ChangeEvent) error {
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -212,15 +273,19 @@ func (c *last9Client) send(ctx context.Context, orgSlug string, event ChangeEven
 	}
 	token, err := c.tokens.token(ctx)
 	if err != nil {
-		return err
+		return &deliveryError{err: err}
 	}
 	endpoint := c.baseURL + "/api/v4/organizations/" + url.PathEscape(orgSlug) + "/change_events"
 	delay := c.backoff
 	var lastErr error
-	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+	attempts := 0
+	retryAttempt := 1
+	authRetried := false
+	for {
+		attempts++
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
 		if err != nil {
-			return err
+			return &deliveryError{attempts: attempts, err: err}
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-LAST9-API-TOKEN", "Bearer "+token)
@@ -232,22 +297,32 @@ func (c *last9Client) send(ctx context.Context, orgSlug string, event ChangeEven
 				return nil
 			}
 			lastErr = fmt.Errorf("Last9 returned status %d", resp.StatusCode)
+			if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && c.tokens.refreshToken != "" && !authRetried {
+				authRetried = true
+				c.tokens.invalidate(token)
+				token, err = c.tokens.token(ctx)
+				if err != nil {
+					return &deliveryError{attempts: attempts, err: fmt.Errorf("refresh Last9 access token after authorization failure: %w", err)}
+				}
+				continue
+			}
 			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-				return lastErr
+				return &deliveryError{attempts: attempts, err: lastErr}
 			}
 		} else {
 			lastErr = fmt.Errorf("send Last9 change event: %w", err)
 		}
-		if attempt < c.maxAttempts {
-			if err := c.wait(ctx, delay); err != nil {
-				return err
-			}
-			if delay < 15*time.Second {
-				delay *= 2
-			}
+		if retryAttempt >= c.maxAttempts {
+			return &deliveryError{attempts: attempts, err: lastErr}
+		}
+		if err := c.wait(ctx, delay); err != nil {
+			return &deliveryError{attempts: attempts, err: err}
+		}
+		retryAttempt++
+		if delay < 15*time.Second {
+			delay *= 2
 		}
 	}
-	return lastErr
 }
 
 type server struct {
@@ -321,8 +396,18 @@ func (s *server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dedupKey := idempotencyKey(executionID, lifecycle)
-	if !s.dedup.reserve(dedupKey, s.now()) {
+	switch s.dedup.reserve(dedupKey, s.now()) {
+	case dedupCompleted:
+		log.Printf("suppress completed duplicate execution_id=%q lifecycle=%q application=%q pipeline=%q service=%q deployment_environment=%q dedup_key=%q", executionID, lifecycle, incoming.Details.Application, incoming.Content.Execution.Name, mapping.ServiceName, mapping.DeploymentEnvironment, dedupKey)
 		w.WriteHeader(http.StatusNoContent)
+		return
+	case dedupInFlight:
+		log.Printf("reject in-flight duplicate execution_id=%q lifecycle=%q application=%q pipeline=%q service=%q deployment_environment=%q dedup_key=%q", executionID, lifecycle, incoming.Details.Application, incoming.Content.Execution.Name, mapping.ServiceName, mapping.DeploymentEnvironment, dedupKey)
+		http.Error(w, "matching change event is still being delivered", http.StatusServiceUnavailable)
+		return
+	case dedupFull:
+		log.Printf("dedup capacity exhausted execution_id=%q lifecycle=%q application=%q pipeline=%q service=%q deployment_environment=%q dedup_key=%q", executionID, lifecycle, incoming.Details.Application, incoming.Content.Execution.Name, mapping.ServiceName, mapping.DeploymentEnvironment, dedupKey)
+		http.Error(w, "change event deduplication is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	event := buildChangeEvent(incoming, mapping, lifecycle, s.eventName, dedupKey, s.now())
@@ -334,10 +419,16 @@ func (s *server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	if err := s.last9.send(ctx, s.orgSlug, event); err != nil {
 		s.dedup.release(dedupKey)
-		log.Printf("send change event: %v", err)
+		attempts := 0
+		var deliveryErr *deliveryError
+		if errors.As(err, &deliveryErr) {
+			attempts = deliveryErr.attempts
+		}
+		log.Printf("send change event failed attempts=%d execution_id=%q lifecycle=%q application=%q pipeline=%q service=%q deployment_environment=%q dedup_key=%q error=%v", attempts, executionID, lifecycle, incoming.Details.Application, incoming.Content.Execution.Name, mapping.ServiceName, mapping.DeploymentEnvironment, dedupKey, err)
 		http.Error(w, "Last9 rejected change event", http.StatusBadGateway)
 		return
 	}
+	s.dedup.complete(dedupKey, s.now())
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -362,7 +453,7 @@ func idempotencyKey(executionID, lifecycle string) string {
 
 func buildChangeEvent(in EchoEvent, mapping Mapping, lifecycle, eventName, dedupKey string, fallback time.Time) ChangeEvent {
 	ts, source := eventTimestamp(in, lifecycle, fallback)
-	attributes := map[string]any{
+	attributes := map[string]string{
 		"service_name":           mapping.ServiceName,
 		"deployment_environment": mapping.DeploymentEnvironment,
 		"spinnaker_application":  in.Details.Application,
@@ -381,6 +472,10 @@ func buildChangeEvent(in EchoEvent, mapping Mapping, lifecycle, eventName, dedup
 	if user := in.Content.Execution.Trigger.User; user != "" {
 		attributes["trigger_user"] = user
 	}
+	if triggerType := in.Content.Execution.Trigger.Type; triggerType != "" {
+		attributes["trigger_type"] = triggerType
+	}
+	addArtifactMetadata(attributes, in)
 	if revision := revisionFrom(in); revision != "" {
 		attributes["revision"] = revision
 	}
@@ -393,6 +488,72 @@ func buildChangeEvent(in EchoEvent, mapping Mapping, lifecycle, eventName, dedup
 		EventState: lifecycle,
 		Attributes: attributes,
 	}
+}
+
+type redactedArtifact struct {
+	Type            string `json:"type"`
+	Name            string `json:"name"`
+	Version         string `json:"version"`
+	ReferenceSHA256 string `json:"reference_sha256"`
+}
+
+func addArtifactMetadata(attributes map[string]string, in EchoEvent) {
+	artifacts, truncated := redactedArtifacts(in)
+	if len(artifacts) == 0 && !truncated {
+		return
+	}
+	attributes["artifact_count"] = strconv.Itoa(len(artifacts))
+	if len(artifacts) > 0 {
+		encoded, _ := json.Marshal(artifacts)
+		attributes["artifacts"] = string(encoded)
+	}
+	if truncated {
+		attributes["artifact_metadata_truncated"] = "true"
+	}
+}
+
+func redactedArtifacts(in EchoEvent) ([]redactedArtifact, bool) {
+	seen := make(map[redactedArtifact]struct{})
+	truncated := false
+	for _, artifacts := range [][]Artifact{in.Content.Execution.Trigger.Artifacts, in.Content.Execution.Artifacts} {
+		for _, artifact := range artifacts {
+			if artifact.Type == "" && artifact.Name == "" && artifact.Version == "" && artifact.Reference == "" {
+				continue
+			}
+			redacted := redactedArtifact{}
+			redacted.Type, truncated = clippedArtifactField(artifact.Type, truncated)
+			redacted.Name, truncated = clippedArtifactField(artifact.Name, truncated)
+			redacted.Version, truncated = clippedArtifactField(artifact.Version, truncated)
+			referenceHash := sha256.Sum256([]byte(artifact.Reference))
+			redacted.ReferenceSHA256 = hex.EncodeToString(referenceHash[:])
+			seen[redacted] = struct{}{}
+		}
+	}
+	result := make([]redactedArtifact, 0, len(seen))
+	for artifact := range seen {
+		result = append(result, artifact)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i].Type + "\x00" + result[i].Name + "\x00" + result[i].Version + "\x00" + result[i].ReferenceSHA256
+		right := result[j].Type + "\x00" + result[j].Name + "\x00" + result[j].Version + "\x00" + result[j].ReferenceSHA256
+		return left < right
+	})
+	if len(result) > maxArtifactCount {
+		result = result[:maxArtifactCount]
+		truncated = true
+	}
+	return result, truncated
+}
+
+func clippedArtifactField(value string, alreadyTruncated bool) (string, bool) {
+	if len(value) <= maxArtifactFieldBytes {
+		return value, alreadyTruncated
+	}
+	end := maxArtifactFieldBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end], true
 }
 
 func eventTimestamp(in EchoEvent, lifecycle string, fallback time.Time) (time.Time, string) {
