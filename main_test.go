@@ -203,6 +203,50 @@ func TestHandlerFiltersAndDeduplicates(t *testing.T) {
 	}
 }
 
+// TestHandlerAcceptsTrailingSlash reproduces a real-world failure: Spinnaker
+// Echo's Retrofit 1.9 REST client (Echo builds prior to the Spinnaker
+// 2025.0.7 / 2025.1.2 fix) appends a trailing slash to whatever endpoint URL
+// operators configure in echo.yml, so every event actually arrives as
+// "POST /events/" even when the bridge is configured with "/events". Before
+// this fix, Go's exact-match ServeMux pattern "POST /events" returned 404 for
+// that request, and Echo logged "Could not send event ... to
+// http://<bridge>:8080/events." with no diagnostic on the bridge side.
+// See https://github.com/spinnaker/spinnaker/issues/1951.
+func TestHandlerAcceptsTrailingSlash(t *testing.T) {
+	var received atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer api.Close()
+	m := mapping()
+	s := &server{
+		orgSlug:  "example",
+		mappings: map[string]Mapping{mappingKey(m.Application, m.Pipeline): m},
+		last9: &last9Client{
+			httpClient: api.Client(), baseURL: api.URL,
+			tokens: &tokenSource{accessToken: "token"}, maxAttempts: 1,
+			backoff: time.Millisecond, wait: func(context.Context, time.Duration) error { return nil },
+		},
+		dedup:     newDeduper(time.Hour),
+		eventName: "deployment",
+		now:       func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	handler := s.routes()
+
+	body, _ := json.Marshal(fixture("orca:pipeline:starting", "RUNNING"))
+	req := httptest.NewRequest(http.MethodPost, "/events/", strings.NewReader(string(body)))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("POST /events/ status = %d, want %d", resp.Code, http.StatusAccepted)
+	}
+	if received.Load() != 1 {
+		t.Fatalf("received %d events at Last9, want 1", received.Load())
+	}
+}
+
 func TestHandlerDoesNotAcknowledgeInFlightDuplicate(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
