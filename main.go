@@ -347,6 +347,14 @@ func (s *server) routes() http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("POST /events", s.handleEvent)
+	// Spinnaker Echo's REST listener (Retrofit 1.9, used by Echo builds prior to
+	// the Spinnaker 2025.0.7 / 2025.1.2 fix "make it possible to send events to
+	// URLs with no trailing slash") appends a trailing slash to whatever
+	// endpoint URL is configured, regardless of the configured value. Operators
+	// on those Echo versions cannot avoid this by editing echo.yml, so the
+	// bridge accepts the trailing-slash form as an alias for the same handler.
+	// See https://github.com/spinnaker/spinnaker/issues/1951.
+	mux.HandleFunc("POST /events/", s.handleEvent)
 	return mux
 }
 
