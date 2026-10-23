@@ -112,6 +112,9 @@ go vet ./...
 go build ./...
 ```
 
+CI runs the format, vet and test checks on every pull request before building
+the image.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
