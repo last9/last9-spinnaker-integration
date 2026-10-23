@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -461,4 +463,49 @@ func TestShortLivedTokenCachesForHalfItsLifetime(t *testing.T) {
 	if err != nil || third != "access-2" || calls.Load() != 2 {
 		t.Fatalf("refreshed token=%q calls=%d err=%v", third, calls.Load(), err)
 	}
+}
+
+// Go 1.26.10 / 1.27.3 are the first releases that distrust the compromised
+// eMudhra intermediate CAs, so neither the module nor the image builder may
+// resolve to anything older.
+func TestToolchainPinnedToPatchedGo(t *testing.T) {
+	const minimum = "1.27.3"
+	goMod, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modMatch := regexp.MustCompile(`(?m)^go (\S+)$`).FindSubmatch(goMod)
+	imageMatch := regexp.MustCompile(`(?m)^FROM golang:(\S+)-alpine `).FindSubmatch(dockerfile)
+	if modMatch == nil || imageMatch == nil {
+		t.Fatalf("go directive=%q builder image=%q not found", modMatch, imageMatch)
+	}
+	modVersion, imageVersion := string(modMatch[1]), string(imageMatch[1])
+	if modVersion != imageVersion {
+		t.Fatalf("go.mod go %s and Dockerfile golang:%s must match", modVersion, imageVersion)
+	}
+	if !versionAtLeast(modVersion, minimum) {
+		t.Fatalf("go %s must be an exact patch release >= %s", modVersion, minimum)
+	}
+}
+
+func versionAtLeast(version, minimum string) bool {
+	have, want := strings.Split(version, "."), strings.Split(minimum, ".")
+	if len(have) != len(want) {
+		return false
+	}
+	for i := range want {
+		h, errH := strconv.Atoi(have[i])
+		w, errW := strconv.Atoi(want[i])
+		if errH != nil || errW != nil {
+			return false
+		}
+		if h != w {
+			return h > w
+		}
+	}
+	return true
 }
