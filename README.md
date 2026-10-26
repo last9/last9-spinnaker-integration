@@ -102,7 +102,8 @@ modify pipelines or deployed workloads.
 
 ## Develop
 
-Go 1.27 is required.
+Go 1.27.3 or later is required; it is the first 1.27 release that distrusts
+the compromised eMudhra intermediate CAs.
 
 ```sh
 gofmt -w main.go main_test.go
@@ -110,6 +111,9 @@ go test ./...
 go vet ./...
 go build ./...
 ```
+
+CI runs the format, vet and test checks on every pull request before building
+the image.
 
 ## License
 
